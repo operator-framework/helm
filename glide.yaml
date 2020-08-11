@@ -1,5 +1,7 @@
 package: k8s.io/helm
 import:
+- package: golang.org/x/text/
+  version: ^0.3.3
 - package: golang.org/x/net
   subpackages:
   - context
