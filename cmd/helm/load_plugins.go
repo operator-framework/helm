@@ -1,5 +1,5 @@
 /*
-Copyright 2016 The Kubernetes Authors All rights reserved.
+Copyright The Helm Authors.
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
@@ -22,11 +22,18 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 
+	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
 
-	"k8s.io/helm/pkg/plugin"
+	"helm.sh/helm/v3/pkg/plugin"
 )
+
+type pluginError struct {
+	error
+	code int
+}
 
 // loadPlugins loads plugins into the command list.
 //
@@ -40,8 +47,7 @@ func loadPlugins(baseCmd *cobra.Command, out io.Writer) {
 		return
 	}
 
-	// debug("HELM_PLUGIN_DIRS=%s", settings.PluginDirs())
-	found, err := findPlugins(settings.PluginDirs())
+	found, err := findPlugins(settings.PluginsDirectory)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to load plugins: %s", err)
 		return
@@ -77,17 +83,30 @@ func loadPlugins(baseCmd *cobra.Command, out io.Writer) {
 				// PrepareCommand uses os.ExpandEnv and expects the
 				// setupEnv vars.
 				plugin.SetupPluginEnv(settings, md.Name, plug.Dir)
-				main, argv := plug.PrepareCommand(u)
+				main, argv, prepCmdErr := plug.PrepareCommand(u)
+				if prepCmdErr != nil {
+					os.Stderr.WriteString(prepCmdErr.Error())
+					return errors.Errorf("plugin %q exited with error", md.Name)
+				}
+
+				env := os.Environ()
+				for k, v := range settings.EnvVars() {
+					env = append(env, fmt.Sprintf("%s=%s", k, v))
+				}
 
 				prog := exec.Command(main, argv...)
-				prog.Env = os.Environ()
+				prog.Env = env
 				prog.Stdin = os.Stdin
 				prog.Stdout = out
 				prog.Stderr = os.Stderr
 				if err := prog.Run(); err != nil {
 					if eerr, ok := err.(*exec.ExitError); ok {
 						os.Stderr.Write(eerr.Stderr)
-						return fmt.Errorf("plugin %q exited with error", md.Name)
+						status := eerr.Sys().(syscall.WaitStatus)
+						return pluginError{
+							error: errors.Errorf("plugin %q exited with error", md.Name),
+							code:  status.ExitStatus(),
+						}
 					}
 					return err
 				}
@@ -95,16 +114,6 @@ func loadPlugins(baseCmd *cobra.Command, out io.Writer) {
 			},
 			// This passes all the flags to the subcommand.
 			DisableFlagParsing: true,
-		}
-
-		if md.UseTunnel {
-			c.PreRunE = func(cmd *cobra.Command, args []string) error {
-				// Parse the parent flag, but not the local flags.
-				if _, err := processParent(cmd, args); err != nil {
-					return err
-				}
-				return setupConnection()
-			}
 		}
 
 		// TODO: Make sure a command with this name does not already exist.
@@ -118,7 +127,7 @@ func loadPlugins(baseCmd *cobra.Command, out io.Writer) {
 func manuallyProcessArgs(args []string) ([]string, []string) {
 	known := []string{}
 	unknown := []string{}
-	kvargs := []string{"--host", "--kube-context", "--home", "--tiller-namespace"}
+	kvargs := []string{"--kube-context", "--namespace", "-n", "--kubeconfig", "--registry-config", "--repository-cache", "--repository-config"}
 	knownArg := func(a string) bool {
 		for _, pre := range kvargs {
 			if strings.HasPrefix(a, pre+"=") {
@@ -127,13 +136,26 @@ func manuallyProcessArgs(args []string) ([]string, []string) {
 		}
 		return false
 	}
+
+	isKnown := func(v string) string {
+		for _, i := range kvargs {
+			if i == v {
+				return v
+			}
+		}
+		return ""
+	}
+
 	for i := 0; i < len(args); i++ {
 		switch a := args[i]; a {
 		case "--debug":
 			known = append(known, a)
-		case "--host", "--kube-context", "--home":
-			known = append(known, a, args[i+1])
+		case isKnown(a):
+			known = append(known, a)
 			i++
+			if i < len(args) {
+				known = append(known, args[i])
+			}
 		default:
 			if knownArg(a) {
 				known = append(known, a)

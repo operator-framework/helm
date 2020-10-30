@@ -1,5 +1,5 @@
 /*
-Copyright 2016 The Kubernetes Authors All rights reserved.
+Copyright The Helm Authors.
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
@@ -13,22 +13,24 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package installer // import "k8s.io/helm/pkg/plugin/installer"
+package installer // import "helm.sh/helm/v3/pkg/plugin/installer"
 
 import (
 	"archive/tar"
 	"bytes"
 	"compress/gzip"
-	"fmt"
 	"io"
-	"k8s.io/helm/pkg/getter"
-	"k8s.io/helm/pkg/helm/environment"
-	"k8s.io/helm/pkg/helm/helmpath"
-	"k8s.io/helm/pkg/plugin/cache"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
+
+	"github.com/pkg/errors"
+
+	"helm.sh/helm/v3/pkg/cli"
+	"helm.sh/helm/v3/pkg/getter"
+	"helm.sh/helm/v3/pkg/helmpath"
+	"helm.sh/helm/v3/pkg/plugin/cache"
 )
 
 // HTTPInstaller installs plugins from an archive served by a web server.
@@ -61,11 +63,11 @@ func NewExtractor(source string) (Extractor, error) {
 			return extractor, nil
 		}
 	}
-	return nil, fmt.Errorf("no extractor implemented yet for %s", source)
+	return nil, errors.Errorf("no extractor implemented yet for %s", source)
 }
 
 // NewHTTPInstaller creates a new HttpInstaller.
-func NewHTTPInstaller(source string, home helmpath.Home) (*HTTPInstaller, error) {
+func NewHTTPInstaller(source string) (*HTTPInstaller, error) {
 
 	key, err := cache.Key(source)
 	if err != nil {
@@ -77,20 +79,15 @@ func NewHTTPInstaller(source string, home helmpath.Home) (*HTTPInstaller, error)
 		return nil, err
 	}
 
-	getConstructor, err := getter.ByScheme("http", environment.EnvSettings{})
-	if err != nil {
-		return nil, err
-	}
-
-	get, err := getConstructor.New(source, "", "", "")
+	get, err := getter.All(new(cli.EnvSettings)).ByScheme("http")
 	if err != nil {
 		return nil, err
 	}
 
 	i := &HTTPInstaller{
-		CacheDir:   home.Path("cache", "plugins", key),
+		CacheDir:   helmpath.CachePath("plugins", key),
 		PluginName: stripPluginName(filepath.Base(source)),
-		base:       newBase(source, home),
+		base:       newBase(source),
 		extractor:  extractor,
 		getter:     get,
 	}
@@ -110,7 +107,8 @@ func stripPluginName(name string) string {
 	return re.ReplaceAllString(strippedName, `$1`)
 }
 
-// Install downloads and extracts the tarball into the cache directory and creates a symlink to the plugin directory in $HELM_HOME.
+// Install downloads and extracts the tarball into the cache directory
+// and creates a symlink to the plugin directory.
 //
 // Implements Installer.
 func (i *HTTPInstaller) Install() error {
@@ -140,7 +138,7 @@ func (i *HTTPInstaller) Install() error {
 // Update updates a local repository
 // Not implemented for now since tarball most likely will be packaged by version
 func (i *HTTPInstaller) Update() error {
-	return fmt.Errorf("method Update() not implemented for HttpInstaller")
+	return errors.Errorf("method Update() not implemented for HttpInstaller")
 }
 
 // Override link because we want to use HttpInstaller.Path() not base.Path()
@@ -154,7 +152,7 @@ func (i HTTPInstaller) Path() string {
 	if i.base.Source == "" {
 		return ""
 	}
-	return filepath.Join(i.base.HelmHome.Plugins(), i.PluginName)
+	return helmpath.DataPath("plugins", i.PluginName)
 }
 
 // Extract extracts compressed archives
@@ -170,7 +168,7 @@ func (g *TarGzExtractor) Extract(buffer *bytes.Buffer, targetDir string) error {
 
 	os.MkdirAll(targetDir, 0755)
 
-	for true {
+	for {
 		header, err := tarReader.Next()
 
 		if err == io.EOF {
@@ -189,16 +187,17 @@ func (g *TarGzExtractor) Extract(buffer *bytes.Buffer, targetDir string) error {
 				return err
 			}
 		case tar.TypeReg:
-			outFile, err := os.Create(path)
+			outFile, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, os.FileMode(header.Mode))
 			if err != nil {
 				return err
 			}
-			defer outFile.Close()
 			if _, err := io.Copy(outFile, tarReader); err != nil {
+				outFile.Close()
 				return err
 			}
+			outFile.Close()
 		default:
-			return fmt.Errorf("unknown type: %b in %s", header.Typeflag, header.Name)
+			return errors.Errorf("unknown type: %b in %s", header.Typeflag, header.Name)
 		}
 	}
 

@@ -1,5 +1,5 @@
 /*
-Copyright 2016 The Kubernetes Authors All rights reserved.
+Copyright The Helm Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,21 +14,21 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package driver // import "k8s.io/helm/pkg/storage/driver"
+package driver // import "helm.sh/helm/v3/pkg/storage/driver"
 
 import (
-	"fmt"
+	"github.com/pkg/errors"
 
-	rspb "k8s.io/helm/pkg/proto/hapi/release"
+	rspb "helm.sh/helm/v3/pkg/release"
 )
 
 var (
 	// ErrReleaseNotFound indicates that a release is not found.
-	ErrReleaseNotFound = func(release string) error { return fmt.Errorf("release: %q not found", release) }
+	ErrReleaseNotFound = errors.New("release: not found")
 	// ErrReleaseExists indicates that a release already exists.
-	ErrReleaseExists = func(release string) error { return fmt.Errorf("release: %q already exists", release) }
+	ErrReleaseExists = errors.New("release: already exists")
 	// ErrInvalidKey indicates that a release key could not be parsed.
-	ErrInvalidKey = func(release string) error { return fmt.Errorf("release: %q invalid key", release) }
+	ErrInvalidKey = errors.Errorf("release: invalid key")
 )
 
 // Creator is the interface that wraps the Create method.
@@ -71,7 +71,7 @@ type Queryor interface {
 
 // Driver is the interface composed of Creator, Updator, Deletor, and Queryor
 // interfaces. It defines the behavior for storing, updating, deleted,
-// and retrieving Tiller releases from some underlying storage mechanism,
+// and retrieving Helm releases from some underlying storage mechanism,
 // e.g. memory, configmaps.
 type Driver interface {
 	Creator

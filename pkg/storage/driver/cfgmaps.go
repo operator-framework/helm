@@ -1,5 +1,5 @@
 /*
-Copyright 2016 The Kubernetes Authors All rights reserved.
+Copyright The Helm Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,22 +14,22 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package driver // import "k8s.io/helm/pkg/storage/driver"
+package driver // import "helm.sh/helm/v3/pkg/storage/driver"
 
 import (
-	"fmt"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/pkg/errors"
+	v1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	kblabels "k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/validation"
-	"k8s.io/kubernetes/pkg/apis/core"
-	"k8s.io/kubernetes/pkg/client/clientset_generated/internalclientset/typed/core/internalversion"
+	corev1 "k8s.io/client-go/kubernetes/typed/core/v1"
 
-	rspb "k8s.io/helm/pkg/proto/hapi/release"
+	rspb "helm.sh/helm/v3/pkg/release"
 )
 
 var _ Driver = (*ConfigMaps)(nil)
@@ -40,13 +40,13 @@ const ConfigMapsDriverName = "ConfigMap"
 // ConfigMaps is a wrapper around an implementation of a kubernetes
 // ConfigMapsInterface.
 type ConfigMaps struct {
-	impl internalversion.ConfigMapInterface
+	impl corev1.ConfigMapInterface
 	Log  func(string, ...interface{})
 }
 
 // NewConfigMaps initializes a new ConfigMaps wrapping an implementation of
 // the kubernetes ConfigMapsInterface.
-func NewConfigMaps(impl internalversion.ConfigMapInterface) *ConfigMaps {
+func NewConfigMaps(impl corev1.ConfigMapInterface) *ConfigMaps {
 	return &ConfigMaps{
 		impl: impl,
 		Log:  func(_ string, _ ...interface{}) {},
@@ -65,7 +65,7 @@ func (cfgmaps *ConfigMaps) Get(key string) (*rspb.Release, error) {
 	obj, err := cfgmaps.impl.Get(key, metav1.GetOptions{})
 	if err != nil {
 		if apierrors.IsNotFound(err) {
-			return nil, ErrReleaseNotFound(key)
+			return nil, ErrReleaseNotFound
 		}
 
 		cfgmaps.Log("get: failed to get %q: %s", key, err)
@@ -85,7 +85,7 @@ func (cfgmaps *ConfigMaps) Get(key string) (*rspb.Release, error) {
 // that filter(release) == true. An error is returned if the
 // configmap fails to retrieve the releases.
 func (cfgmaps *ConfigMaps) List(filter func(*rspb.Release) bool) ([]*rspb.Release, error) {
-	lsel := kblabels.Set{"OWNER": "TILLER"}.AsSelector()
+	lsel := kblabels.Set{"owner": "helm"}.AsSelector()
 	opts := metav1.ListOptions{LabelSelector: lsel.String()}
 
 	list, err := cfgmaps.impl.List(opts)
@@ -117,7 +117,7 @@ func (cfgmaps *ConfigMaps) Query(labels map[string]string) ([]*rspb.Release, err
 	ls := kblabels.Set{}
 	for k, v := range labels {
 		if errs := validation.IsValidLabelValue(v); len(errs) != 0 {
-			return nil, fmt.Errorf("invalid label value: %q: %s", v, strings.Join(errs, "; "))
+			return nil, errors.Errorf("invalid label value: %q: %s", v, strings.Join(errs, "; "))
 		}
 		ls[k] = v
 	}
@@ -131,7 +131,7 @@ func (cfgmaps *ConfigMaps) Query(labels map[string]string) ([]*rspb.Release, err
 	}
 
 	if len(list.Items) == 0 {
-		return nil, ErrReleaseNotFound(labels["NAME"])
+		return nil, ErrReleaseNotFound
 	}
 
 	var results []*rspb.Release
@@ -153,7 +153,7 @@ func (cfgmaps *ConfigMaps) Create(key string, rls *rspb.Release) error {
 	var lbs labels
 
 	lbs.init()
-	lbs.set("CREATED_AT", strconv.Itoa(int(time.Now().Unix())))
+	lbs.set("createdAt", strconv.Itoa(int(time.Now().Unix())))
 
 	// create a new configmap to hold the release
 	obj, err := newConfigMapsObject(key, rls, lbs)
@@ -164,7 +164,7 @@ func (cfgmaps *ConfigMaps) Create(key string, rls *rspb.Release) error {
 	// push the configmap object out into the kubiverse
 	if _, err := cfgmaps.impl.Create(obj); err != nil {
 		if apierrors.IsAlreadyExists(err) {
-			return ErrReleaseExists(key)
+			return ErrReleaseExists
 		}
 
 		cfgmaps.Log("create: failed to create: %s", err)
@@ -180,7 +180,7 @@ func (cfgmaps *ConfigMaps) Update(key string, rls *rspb.Release) error {
 	var lbs labels
 
 	lbs.init()
-	lbs.set("MODIFIED_AT", strconv.Itoa(int(time.Now().Unix())))
+	lbs.set("modifiedAt", strconv.Itoa(int(time.Now().Unix())))
 
 	// create a new configmap object to hold the release
 	obj, err := newConfigMapsObject(key, rls, lbs)
@@ -202,7 +202,7 @@ func (cfgmaps *ConfigMaps) Delete(key string) (rls *rspb.Release, err error) {
 	// fetch the release to check existence
 	if rls, err = cfgmaps.Get(key); err != nil {
 		if apierrors.IsNotFound(err) {
-			return nil, ErrReleaseExists(rls.Name)
+			return nil, ErrReleaseExists
 		}
 
 		cfgmaps.Log("delete: failed to get release %q: %s", key, err)
@@ -217,19 +217,19 @@ func (cfgmaps *ConfigMaps) Delete(key string) (rls *rspb.Release, err error) {
 
 // newConfigMapsObject constructs a kubernetes ConfigMap object
 // to store a release. Each configmap data entry is the base64
-// encoded string of a release's binary protobuf encoding.
+// encoded gzipped string of a release.
 //
 // The following labels are used within each configmap:
 //
-//    "MODIFIED_AT"    - timestamp indicating when this configmap was last modified. (set in Update)
-//    "CREATED_AT"     - timestamp indicating when this configmap was created. (set in Create)
-//    "VERSION"        - version of the release.
-//    "STATUS"         - status of the release (see proto/hapi/release.status.pb.go for variants)
-//    "OWNER"          - owner of the configmap, currently "TILLER".
-//    "NAME"           - name of the release.
+//    "modifiedAt"     - timestamp indicating when this configmap was last modified. (set in Update)
+//    "createdAt"      - timestamp indicating when this configmap was created. (set in Create)
+//    "version"        - version of the release.
+//    "status"         - status of the release (see pkg/release/status.go for variants)
+//    "owner"          - owner of the configmap, currently "helm".
+//    "name"           - name of the release.
 //
-func newConfigMapsObject(key string, rls *rspb.Release, lbs labels) (*core.ConfigMap, error) {
-	const owner = "TILLER"
+func newConfigMapsObject(key string, rls *rspb.Release, lbs labels) (*v1.ConfigMap, error) {
+	const owner = "helm"
 
 	// encode the release
 	s, err := encodeRelease(rls)
@@ -242,13 +242,13 @@ func newConfigMapsObject(key string, rls *rspb.Release, lbs labels) (*core.Confi
 	}
 
 	// apply labels
-	lbs.set("NAME", rls.Name)
-	lbs.set("OWNER", owner)
-	lbs.set("STATUS", rspb.Status_Code_name[int32(rls.Info.Status.Code)])
-	lbs.set("VERSION", strconv.Itoa(int(rls.Version)))
+	lbs.set("name", rls.Name)
+	lbs.set("owner", owner)
+	lbs.set("status", rls.Info.Status.String())
+	lbs.set("version", strconv.Itoa(rls.Version))
 
 	// create and return configmap object
-	return &core.ConfigMap{
+	return &v1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:   key,
 			Labels: lbs.toMap(),

@@ -1,5 +1,5 @@
 /*
-Copyright 2016 The Kubernetes Authors All rights reserved.
+Copyright The Helm Authors.
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
@@ -13,12 +13,57 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package plugin // import "k8s.io/helm/pkg/plugin"
+package plugin // import "helm.sh/helm/v3/pkg/plugin"
 
 import (
+	"os"
+	"path/filepath"
 	"reflect"
+	"runtime"
 	"testing"
+
+	"helm.sh/helm/v3/pkg/cli"
 )
+
+func checkCommand(p *Plugin, extraArgs []string, osStrCmp string, t *testing.T) {
+	cmd, args, err := p.PrepareCommand(extraArgs)
+	if err != nil {
+		t.Errorf(err.Error())
+	}
+	if cmd != "echo" {
+		t.Errorf("Expected echo, got %q", cmd)
+	}
+
+	if l := len(args); l != 5 {
+		t.Errorf("expected 5 args, got %d", l)
+	}
+
+	expect := []string{"-n", osStrCmp, "--debug", "--foo", "bar"}
+	for i := 0; i < len(args); i++ {
+		if expect[i] != args[i] {
+			t.Errorf("Expected arg=%q, got %q", expect[i], args[i])
+		}
+	}
+
+	// Test with IgnoreFlags. This should omit --debug, --foo, bar
+	p.Metadata.IgnoreFlags = true
+	cmd, args, err = p.PrepareCommand(extraArgs)
+	if err != nil {
+		t.Errorf(err.Error())
+	}
+	if cmd != "echo" {
+		t.Errorf("Expected echo, got %q", cmd)
+	}
+	if l := len(args); l != 2 {
+		t.Errorf("expected 2 args, got %d", l)
+	}
+	expect = []string{"-n", osStrCmp}
+	for i := 0; i < len(args); i++ {
+		if expect[i] != args[i] {
+			t.Errorf("Expected arg=%q, got %q", expect[i], args[i])
+		}
+	}
+}
 
 func TestPrepareCommand(t *testing.T) {
 	p := &Plugin{
@@ -30,36 +75,98 @@ func TestPrepareCommand(t *testing.T) {
 	}
 	argv := []string{"--debug", "--foo", "bar"}
 
-	cmd, args := p.PrepareCommand(argv)
-	if cmd != "echo" {
-		t.Errorf("Expected echo, got %q", cmd)
+	checkCommand(p, argv, "foo", t)
+}
+
+func TestPlatformPrepareCommand(t *testing.T) {
+	p := &Plugin{
+		Dir: "/tmp", // Unused
+		Metadata: &Metadata{
+			Name:    "test",
+			Command: "echo -n os-arch",
+			PlatformCommand: []PlatformCommand{
+				{OperatingSystem: "linux", Architecture: "i386", Command: "echo -n linux-i386"},
+				{OperatingSystem: "linux", Architecture: "amd64", Command: "echo -n linux-amd64"},
+				{OperatingSystem: "linux", Architecture: "s390x", Command: "echo -n linux-s390x"},
+				{OperatingSystem: "windows", Architecture: "amd64", Command: "echo -n win-64"},
+			},
+		},
+	}
+	var osStrCmp string
+	os := runtime.GOOS
+	arch := runtime.GOARCH
+	if os == "linux" && arch == "i386" {
+		osStrCmp = "linux-i386"
+	} else if os == "linux" && arch == "amd64" {
+		osStrCmp = "linux-amd64"
+	} else if os == "linux" && arch == "s390x" {
+		osStrCmp = "linux-s390x"
+	} else if os == "windows" && arch == "amd64" {
+		osStrCmp = "win-64"
+	} else {
+		osStrCmp = "os-arch"
 	}
 
-	if l := len(args); l != 5 {
-		t.Errorf("expected 5 args, got %d", l)
+	argv := []string{"--debug", "--foo", "bar"}
+	checkCommand(p, argv, osStrCmp, t)
+}
+
+func TestPartialPlatformPrepareCommand(t *testing.T) {
+	p := &Plugin{
+		Dir: "/tmp", // Unused
+		Metadata: &Metadata{
+			Name:    "test",
+			Command: "echo -n os-arch",
+			PlatformCommand: []PlatformCommand{
+				{OperatingSystem: "linux", Architecture: "i386", Command: "echo -n linux-i386"},
+				{OperatingSystem: "windows", Architecture: "amd64", Command: "echo -n win-64"},
+			},
+		},
+	}
+	var osStrCmp string
+	os := runtime.GOOS
+	arch := runtime.GOARCH
+	if os == "linux" {
+		osStrCmp = "linux-i386"
+	} else if os == "windows" && arch == "amd64" {
+		osStrCmp = "win-64"
+	} else {
+		osStrCmp = "os-arch"
 	}
 
-	expect := []string{"-n", "foo", "--debug", "--foo", "bar"}
-	for i := 0; i < len(args); i++ {
-		if expect[i] != args[i] {
-			t.Errorf("Expected arg=%q, got %q", expect[i], args[i])
-		}
-	}
+	argv := []string{"--debug", "--foo", "bar"}
+	checkCommand(p, argv, osStrCmp, t)
+}
 
-	// Test with IgnoreFlags. This should omit --debug, --foo, bar
-	p.Metadata.IgnoreFlags = true
-	cmd, args = p.PrepareCommand(argv)
-	if cmd != "echo" {
-		t.Errorf("Expected echo, got %q", cmd)
+func TestNoPrepareCommand(t *testing.T) {
+	p := &Plugin{
+		Dir: "/tmp", // Unused
+		Metadata: &Metadata{
+			Name: "test",
+		},
 	}
-	if l := len(args); l != 2 {
-		t.Errorf("expected 2 args, got %d", l)
+	argv := []string{"--debug", "--foo", "bar"}
+
+	_, _, err := p.PrepareCommand(argv)
+	if err == nil {
+		t.Errorf("Expected error to be returned")
 	}
-	expect = []string{"-n", "foo"}
-	for i := 0; i < len(args); i++ {
-		if expect[i] != args[i] {
-			t.Errorf("Expected arg=%q, got %q", expect[i], args[i])
-		}
+}
+
+func TestNoMatchPrepareCommand(t *testing.T) {
+	p := &Plugin{
+		Dir: "/tmp", // Unused
+		Metadata: &Metadata{
+			Name: "test",
+			PlatformCommand: []PlatformCommand{
+				{OperatingSystem: "no-os", Architecture: "amd64", Command: "echo -n linux-i386"},
+			},
+		},
+	}
+	argv := []string{"--debug", "--foo", "bar"}
+
+	if _, _, err := p.PrepareCommand(argv); err == nil {
+		t.Errorf("Expected error to be returned")
 	}
 }
 
@@ -80,7 +187,6 @@ func TestLoadDir(t *testing.T) {
 		Usage:       "usage",
 		Description: "description",
 		Command:     "$HELM_PLUGIN_SELF/hello.sh",
-		UseTunnel:   true,
 		IgnoreFlags: true,
 		Hooks: map[string]string{
 			Install: "echo installing...",
@@ -149,5 +255,26 @@ func TestLoadAll(t *testing.T) {
 	}
 	if plugs[2].Metadata.Name != "hello" {
 		t.Errorf("Expected second plugin to be hello, got %q", plugs[1].Metadata.Name)
+	}
+}
+
+func TestSetupEnv(t *testing.T) {
+	name := "pequod"
+	base := filepath.Join("testdata/helmhome/helm/plugins", name)
+
+	s := &cli.EnvSettings{
+		PluginsDirectory: "testdata/helmhome/helm/plugins",
+	}
+
+	SetupPluginEnv(s, name, base)
+	for _, tt := range []struct {
+		name, expect string
+	}{
+		{"HELM_PLUGIN_NAME", name},
+		{"HELM_PLUGIN_DIR", base},
+	} {
+		if got := os.Getenv(tt.name); got != tt.expect {
+			t.Errorf("Expected $%s=%q, got %q", tt.name, tt.expect, got)
+		}
 	}
 }

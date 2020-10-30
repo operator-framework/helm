@@ -1,5 +1,5 @@
 /*
-Copyright 2016 The Kubernetes Authors All rights reserved.
+Copyright The Helm Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -22,17 +22,17 @@ import (
 	"strings"
 	"testing"
 
-	"k8s.io/helm/pkg/lint/support"
+	"helm.sh/helm/v3/pkg/lint/support"
 )
 
 const templateTestBasedir = "./testdata/albatross"
 
 func TestValidateAllowedExtension(t *testing.T) {
-	var failTest = []string{"/foo", "/test.yml", "/test.toml", "test.yml"}
+	var failTest = []string{"/foo", "/test.toml"}
 	for _, test := range failTest {
 		err := validateAllowedExtension(test)
-		if err == nil || !strings.Contains(err.Error(), "Valid extensions are .yaml, .tpl, or .txt") {
-			t.Errorf("validateAllowedExtension('%s') to return \"Valid extensions are .yaml, .tpl, or .txt\", got no error", test)
+		if err == nil || !strings.Contains(err.Error(), "Valid extensions are .yaml, .yml, .tpl, or .txt") {
+			t.Errorf("validateAllowedExtension('%s') to return \"Valid extensions are .yaml, .yml, .tpl, or .txt\", got no error", test)
 		}
 	}
 	var successTest = []string{"/foo.yaml", "foo.yaml", "foo.tpl", "/foo/bar/baz.yaml", "NOTES.txt"}
@@ -44,7 +44,7 @@ func TestValidateAllowedExtension(t *testing.T) {
 	}
 }
 
-var values = []byte("nameOverride: ''\nhttpPort: 80")
+var values = map[string]interface{}{"nameOverride": "", "httpPort": 80}
 
 const namespace = "testNamespace"
 const strict = false
@@ -79,5 +79,25 @@ func TestTemplateIntegrationHappyPath(t *testing.T) {
 
 	if len(res) != 0 {
 		t.Fatalf("Expected no error, got %d, %v", len(res), res)
+	}
+}
+
+func TestV3Fail(t *testing.T) {
+	linter := support.Linter{ChartDir: "./testdata/v3-fail"}
+	Templates(&linter, values, namespace, strict)
+	res := linter.Messages
+
+	if len(res) != 3 {
+		t.Fatalf("Expected 3 errors, got %d, %v", len(res), res)
+	}
+
+	if !strings.Contains(res[0].Err.Error(), ".Release.Time has been removed in v3") {
+		t.Errorf("Unexpected error: %s", res[0].Err)
+	}
+	if !strings.Contains(res[1].Err.Error(), "manifest is a crd-install hook") {
+		t.Errorf("Unexpected error: %s", res[1].Err)
+	}
+	if !strings.Contains(res[2].Err.Error(), "manifest is a crd-install hook") {
+		t.Errorf("Unexpected error: %s", res[2].Err)
 	}
 }

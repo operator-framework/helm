@@ -1,5 +1,5 @@
 /*
-Copyright 2016 The Kubernetes Authors All rights reserved.
+Copyright The Helm Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,293 +14,84 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package main // import "k8s.io/helm/cmd/helm"
+package main // import "helm.sh/helm/v3/cmd/helm"
 
 import (
-	"errors"
+	"flag"
 	"fmt"
-	"io/ioutil"
 	"log"
 	"os"
 	"strings"
 
 	"github.com/spf13/cobra"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/grpclog"
-	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/rest"
-	"k8s.io/kubernetes/pkg/client/clientset_generated/internalclientset"
+	"github.com/spf13/pflag"
+	"k8s.io/klog"
 
-	"k8s.io/helm/pkg/helm"
-	helm_env "k8s.io/helm/pkg/helm/environment"
-	"k8s.io/helm/pkg/helm/portforwarder"
-	"k8s.io/helm/pkg/kube"
-	"k8s.io/helm/pkg/tlsutil"
+	// Import to initialize client auth plugins.
+	_ "k8s.io/client-go/plugin/pkg/client/auth"
+
+	"helm.sh/helm/v3/pkg/action"
+	"helm.sh/helm/v3/pkg/cli"
+	"helm.sh/helm/v3/pkg/gates"
 )
+
+// FeatureGateOCI is the feature gate for checking if `helm chart` and `helm registry` commands should work
+const FeatureGateOCI = gates.Gate("HELM_EXPERIMENTAL_OCI")
 
 var (
-	tlsCaCertFile string // path to TLS CA certificate file
-	tlsCertFile   string // path to TLS certificate file
-	tlsKeyFile    string // path to TLS key file
-	tlsVerify     bool   // enable TLS and verify remote certificates
-	tlsEnable     bool   // enable TLS
-
-	tlsCaCertDefault = "$HELM_HOME/ca.pem"
-	tlsCertDefault   = "$HELM_HOME/cert.pem"
-	tlsKeyDefault    = "$HELM_HOME/key.pem"
-
-	tillerTunnel *kube.Tunnel
-	settings     helm_env.EnvSettings
+	settings = cli.New()
 )
 
-var globalUsage = `The Kubernetes package manager
-
-To begin working with Helm, run the 'helm init' command:
-
-	$ helm init
-
-This will install Tiller to your running Kubernetes cluster.
-It will also set up any necessary local configuration.
-
-Common actions from this point include:
-
-- helm search:    search for charts
-- helm fetch:     download a chart to your local directory to view
-- helm install:   upload the chart to Kubernetes
-- helm list:      list releases of charts
-
-Environment:
-  $HELM_HOME          set an alternative location for Helm files. By default, these are stored in ~/.helm
-  $HELM_HOST          set an alternative Tiller host. The format is host:port
-  $HELM_NO_PLUGINS    disable plugins. Set HELM_NO_PLUGINS=1 to disable plugins.
-  $TILLER_NAMESPACE   set an alternative Tiller namespace (default "kube-system")
-  $KUBECONFIG         set an alternative Kubernetes configuration file (default "~/.kube/config")
-`
-
-func newRootCmd(args []string) *cobra.Command {
-	cmd := &cobra.Command{
-		Use:          "helm",
-		Short:        "The Helm package manager for Kubernetes.",
-		Long:         globalUsage,
-		SilenceUsage: true,
-		PersistentPreRun: func(*cobra.Command, []string) {
-			tlsCaCertFile = os.ExpandEnv(tlsCaCertFile)
-			tlsCertFile = os.ExpandEnv(tlsCertFile)
-			tlsKeyFile = os.ExpandEnv(tlsKeyFile)
-		},
-		PersistentPostRun: func(*cobra.Command, []string) {
-			teardown()
-		},
-	}
-	flags := cmd.PersistentFlags()
-
-	settings.AddFlags(flags)
-
-	out := cmd.OutOrStdout()
-
-	cmd.AddCommand(
-		// chart commands
-		newCreateCmd(out),
-		newDependencyCmd(out),
-		newFetchCmd(out),
-		newInspectCmd(out),
-		newLintCmd(out),
-		newPackageCmd(out),
-		newRepoCmd(out),
-		newSearchCmd(out),
-		newServeCmd(out),
-		newVerifyCmd(out),
-
-		// release commands
-		addFlagsTLS(newDeleteCmd(nil, out)),
-		addFlagsTLS(newGetCmd(nil, out)),
-		addFlagsTLS(newHistoryCmd(nil, out)),
-		addFlagsTLS(newInstallCmd(nil, out)),
-		addFlagsTLS(newListCmd(nil, out)),
-		addFlagsTLS(newRollbackCmd(nil, out)),
-		addFlagsTLS(newStatusCmd(nil, out)),
-		addFlagsTLS(newUpgradeCmd(nil, out)),
-
-		addFlagsTLS(newReleaseTestCmd(nil, out)),
-		addFlagsTLS(newResetCmd(nil, out)),
-		addFlagsTLS(newVersionCmd(nil, out)),
-
-		newCompletionCmd(out),
-		newHomeCmd(out),
-		newInitCmd(out),
-		newPluginCmd(out),
-		newTemplateCmd(out),
-
-		// Hidden documentation generator command: 'helm docs'
-		newDocsCmd(out),
-
-		// Deprecated
-		markDeprecated(newRepoUpdateCmd(out), "use 'helm repo update'\n"),
-	)
-
-	flags.Parse(args)
-
-	// set defaults from environment
-	settings.Init(flags)
-
-	// Find and add plugins
-	loadPlugins(cmd, out)
-
-	return cmd
+func init() {
+	log.SetFlags(log.Lshortfile)
 }
 
-func init() {
-	// Tell gRPC not to log to console.
-	grpclog.SetLogger(log.New(ioutil.Discard, "", log.LstdFlags))
+func debug(format string, v ...interface{}) {
+	if settings.Debug {
+		format = fmt.Sprintf("[debug] %s\n", format)
+		log.Output(2, fmt.Sprintf(format, v...))
+	}
+}
+
+func initKubeLogs() {
+	pflag.CommandLine.SetNormalizeFunc(wordSepNormalizeFunc)
+	gofs := flag.NewFlagSet("klog", flag.ExitOnError)
+	klog.InitFlags(gofs)
+	pflag.CommandLine.AddGoFlagSet(gofs)
+	pflag.CommandLine.Set("logtostderr", "true")
 }
 
 func main() {
-	cmd := newRootCmd(os.Args[1:])
+	initKubeLogs()
+
+	actionConfig := new(action.Configuration)
+	cmd := newRootCmd(actionConfig, os.Stdout, os.Args[1:])
+
+	if err := actionConfig.Init(settings.RESTClientGetter(), settings.Namespace(), os.Getenv("HELM_DRIVER"), debug); err != nil {
+		log.Fatal(err)
+	}
+
 	if err := cmd.Execute(); err != nil {
-		os.Exit(1)
-	}
-}
-
-func markDeprecated(cmd *cobra.Command, notice string) *cobra.Command {
-	cmd.Deprecated = notice
-	return cmd
-}
-
-func setupConnection() error {
-	if settings.TillerHost == "" {
-		config, client, err := getKubeClient(settings.KubeContext)
-		if err != nil {
-			return err
+		debug("%+v", err)
+		switch e := err.(type) {
+		case pluginError:
+			os.Exit(e.code)
+		default:
+			os.Exit(1)
 		}
+	}
+}
 
-		tunnel, err := portforwarder.New(settings.TillerNamespace, client, config)
-		if err != nil {
-			return err
+// wordSepNormalizeFunc changes all flags that contain "_" separators
+func wordSepNormalizeFunc(f *pflag.FlagSet, name string) pflag.NormalizedName {
+	return pflag.NormalizedName(strings.ReplaceAll(name, "_", "-"))
+}
+
+func checkOCIFeatureGate() func(_ *cobra.Command, _ []string) error {
+	return func(_ *cobra.Command, _ []string) error {
+		if !FeatureGateOCI.IsEnabled() {
+			return FeatureGateOCI.Error()
 		}
-
-		settings.TillerHost = fmt.Sprintf("127.0.0.1:%d", tunnel.Local)
-		debug("Created tunnel using local port: '%d'\n", tunnel.Local)
-	}
-
-	// Set up the gRPC config.
-	debug("SERVER: %q\n", settings.TillerHost)
-
-	// Plugin support.
-	return nil
-}
-
-func teardown() {
-	if tillerTunnel != nil {
-		tillerTunnel.Close()
-	}
-}
-
-func checkArgsLength(argsReceived int, requiredArgs ...string) error {
-	expectedNum := len(requiredArgs)
-	if argsReceived != expectedNum {
-		arg := "arguments"
-		if expectedNum == 1 {
-			arg = "argument"
-		}
-		return fmt.Errorf("This command needs %v %s: %s", expectedNum, arg, strings.Join(requiredArgs, ", "))
-	}
-	return nil
-}
-
-// prettyError unwraps or rewrites certain errors to make them more user-friendly.
-func prettyError(err error) error {
-	if err == nil {
 		return nil
 	}
-	// This is ridiculous. Why is 'grpc.rpcError' not exported? The least they
-	// could do is throw an interface on the lib that would let us get back
-	// the desc. Instead, we have to pass ALL errors through this.
-	return errors.New(grpc.ErrorDesc(err))
-}
-
-// configForContext creates a Kubernetes REST client configuration for a given kubeconfig context.
-func configForContext(context string) (*rest.Config, error) {
-	config, err := kube.GetConfig(context).ClientConfig()
-	if err != nil {
-		return nil, fmt.Errorf("could not get Kubernetes config for context %q: %s", context, err)
-	}
-	return config, nil
-}
-
-// getKubeClient creates a Kubernetes config and client for a given kubeconfig context.
-func getKubeClient(context string) (*rest.Config, kubernetes.Interface, error) {
-	config, err := configForContext(context)
-	if err != nil {
-		return nil, nil, err
-	}
-	client, err := kubernetes.NewForConfig(config)
-	if err != nil {
-		return nil, nil, fmt.Errorf("could not get Kubernetes client: %s", err)
-	}
-	return config, client, nil
-}
-
-// getInternalKubeClient creates a Kubernetes config and an "internal" client for a given kubeconfig context.
-//
-// Prefer the similar getKubeClient if you don't need to use such an internal client.
-func getInternalKubeClient(context string) (internalclientset.Interface, error) {
-	config, err := configForContext(context)
-	if err != nil {
-		return nil, err
-	}
-	client, err := internalclientset.NewForConfig(config)
-	if err != nil {
-		return nil, fmt.Errorf("could not get Kubernetes client: %s", err)
-	}
-	return client, nil
-}
-
-// ensureHelmClient returns a new helm client impl. if h is not nil.
-func ensureHelmClient(h helm.Interface) helm.Interface {
-	if h != nil {
-		return h
-	}
-	return newClient()
-}
-
-func newClient() helm.Interface {
-	options := []helm.Option{helm.Host(settings.TillerHost), helm.ConnectTimeout(settings.TillerConnectionTimeout)}
-
-	if tlsVerify || tlsEnable {
-		if tlsCaCertFile == "" {
-			tlsCaCertFile = settings.Home.TLSCaCert()
-		}
-		if tlsCertFile == "" {
-			tlsCertFile = settings.Home.TLSCert()
-		}
-		if tlsKeyFile == "" {
-			tlsKeyFile = settings.Home.TLSKey()
-		}
-		debug("Key=%q, Cert=%q, CA=%q\n", tlsKeyFile, tlsCertFile, tlsCaCertFile)
-		tlsopts := tlsutil.Options{KeyFile: tlsKeyFile, CertFile: tlsCertFile, InsecureSkipVerify: true}
-		if tlsVerify {
-			tlsopts.CaCertFile = tlsCaCertFile
-			tlsopts.InsecureSkipVerify = false
-		}
-		tlscfg, err := tlsutil.ClientConfig(tlsopts)
-		if err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			os.Exit(2)
-		}
-		options = append(options, helm.WithTLS(tlscfg))
-	}
-	return helm.NewClient(options...)
-}
-
-// addFlagsTLS adds the flags for supporting client side TLS to the
-// helm command (only those that invoke communicate to Tiller.)
-func addFlagsTLS(cmd *cobra.Command) *cobra.Command {
-
-	// add flags
-	cmd.Flags().StringVar(&tlsCaCertFile, "tls-ca-cert", tlsCaCertDefault, "path to TLS CA certificate file")
-	cmd.Flags().StringVar(&tlsCertFile, "tls-cert", tlsCertDefault, "path to TLS certificate file")
-	cmd.Flags().StringVar(&tlsKeyFile, "tls-key", tlsKeyDefault, "path to TLS key file")
-	cmd.Flags().BoolVar(&tlsVerify, "tls-verify", false, "enable TLS for request and verify remote")
-	cmd.Flags().BoolVar(&tlsEnable, "tls", false, "enable TLS for request")
-	return cmd
 }
