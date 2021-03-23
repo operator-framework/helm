@@ -128,6 +128,12 @@ $(GOX):
 $(GOIMPORTS):
 	(cd /; GO111MODULE=on go get -u golang.org/x/tools/cmd/goimports)
 
+.PHONY: vendor
+vendor:
+	go mod tidy
+	go mod vendor
+	go mod verify
+
 # ------------------------------------------------------------------------------
 #  release
 
